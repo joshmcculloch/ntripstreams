@@ -7,8 +7,12 @@ response-parsing tests drive the methods with a small in-memory fake reader.
 """
 
 import asyncio
+import os
 import unittest
 
+from bitstring import BitStream
+
+from ntripstreams.crc import crc24q
 from ntripstreams.ntripstreams import NtripStream
 
 URL = "http://caster.example.net:2101"
@@ -154,6 +158,98 @@ class TestResponseParsing(unittest.IsolatedAsyncioTestCase):
         ns = NtripStream()
         ns.ntripReader = FakeReader(b"5\r\nHELLO\r\n6;ext\r\n WORLD\r\n0\r\n\r\n")
         self.assertEqual(await ns._readChunkedBody(), b"HELLO WORLD")
+
+
+def rtcm_frame(msg_type: int, payload_len: int) -> bytes:
+    """Build a CRC-valid RTCM 3 frame with a zero-filled payload."""
+    head = bytes([0xD3, payload_len >> 8, payload_len & 0xFF])
+    body = bytes([msg_type >> 4, (msg_type & 0x0F) << 4]) + bytes(payload_len - 2)
+    return head + body + crc24q(BitStream(head + body)).to_bytes(3, "big")
+
+
+class CountingReader(asyncio.StreamReader):
+    """StreamReader that fails the test if read() is spun on at EOF."""
+
+    def __init__(self):
+        super().__init__()
+        self.eofReads = 0
+
+    async def read(self, n=-1):
+        data = await super().read(n)
+        if not data:
+            self.eofReads += 1
+            if self.eofReads > 10:
+                raise AssertionError("read() called repeatedly at EOF")
+        return data
+
+
+class TestGetRtcmFrame(unittest.IsolatedAsyncioTestCase):
+    def stream(self, data: bytes = b"", eof: bool = False) -> NtripStream:
+        ns = NtripStream()
+        ns.ntripReader = CountingReader()
+        ns.ntripReader.feed_data(data)
+        if eof:
+            ns.ntripReader.feed_eof()
+        return ns
+
+    async def frame(self, ns):
+        rtcmFrame, _ = await asyncio.wait_for(ns.getRtcmFrame(), timeout=1)
+        return rtcmFrame.bytes
+
+    async def test_buffered_frames_returned_without_waiting_for_more_data(self):
+        # A caster sends one burst per epoch; every frame in the burst must be
+        # returned without waiting for the next burst. The socket stays open.
+        burst = [rtcm_frame(1005, 19), rtcm_frame(1074, 300), rtcm_frame(1084, 250)]
+        ns = self.stream(b"".join(burst))
+        for expected in burst:
+            self.assertEqual(await self.frame(ns), expected)
+
+    async def test_max_size_frame_fed_in_pieces(self):
+        # A 1023-byte payload is the largest RTCM 3 frame (8232 bits).
+        big = rtcm_frame(1077, 1023)
+        ns = self.stream()
+        pending = asyncio.ensure_future(ns.getRtcmFrame())
+        for i in range(0, len(big), 100):
+            ns.ntripReader.feed_data(big[i : i + 100])
+            await asyncio.sleep(0)
+        rtcmFrame, _ = await asyncio.wait_for(pending, timeout=1)
+        self.assertEqual(rtcmFrame.bytes, big)
+
+    async def test_realigns_after_garbage(self):
+        good = rtcm_frame(1005, 19)
+        corrupt = bytearray(rtcm_frame(1074, 40))
+        corrupt[-1] ^= 0xFF
+        ns = self.stream(b"\x00\x01" + bytes(corrupt) + good)
+        self.assertEqual(await self.frame(ns), good)
+
+    async def test_eof_raises_connection_error(self):
+        frame = rtcm_frame(1005, 19)
+        ns = self.stream(frame + frame[:10], eof=True)
+        self.assertEqual(await self.frame(ns), frame)
+        with self.assertRaises(ConnectionError):
+            await self.frame(ns)
+
+    async def test_chunked_eof_raises_connection_error(self):
+        frame = rtcm_frame(1005, 19)
+        ns = self.stream(b"%x\r\n" % len(frame) + frame + b"\r\n", eof=True)
+        ns.ntripStreamChunked = True
+        self.assertEqual(await self.frame(ns), frame)
+        with self.assertRaises(ConnectionError):
+            await self.frame(ns)
+
+    async def test_all_frames_in_real_capture(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "data", "samples", "AgPartner_2.rtcm3"
+        )
+        with open(path, "rb") as f:
+            data = f.read()
+        ns = self.stream(data, eof=True)
+        frames = []
+        with self.assertRaises(ConnectionError):
+            while True:
+                frames.append(await self.frame(ns))
+        self.assertGreater(len(frames), 100)
+        self.assertEqual(b"".join(frames), data[data.index(b"\xd3") :])
 
 
 if __name__ == "__main__":
