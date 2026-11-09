@@ -2,26 +2,24 @@ name: Documentation
 
 on: [push]
 
+permissions:
+  contents: write
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-
-    - name: Set up Python 3.9
-      uses: actions/setup-python@v2
+    - uses: actions/checkout@v7
       with:
-        python-version: 3.9
+        persist-credentials: false
 
-    - name: Setup environment
-      run: pip install \
-        sphinx \
-        sphinx-click \
-        sphinxcontrib.programoutput \
-        sphinx-rtd-theme
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
 
-    - name: Install project
-      run: pip install -e .
+    - name: Install project with docs dependencies
+      run: pip install -e ".[docs]"
 
     - name: Generate docs
       run: |
@@ -29,7 +27,7 @@ jobs:
         touch ./docs/_build/.nojekyll
 
     - name: Deploy docs
-      uses: peaceiris/actions-gh-pages@v3
+      uses: peaceiris/actions-gh-pages@v4
       if: github.ref == 'refs/heads/main'
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}

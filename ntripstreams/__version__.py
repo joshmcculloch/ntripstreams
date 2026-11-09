@@ -1,3 +1,3 @@
-VERSION = (0, 2, 1)
+__version__ = "0.3.5"
 
-__version__ = ".".join(map(str, VERSION))
+VERSION = tuple(int(part) for part in __version__.split("."))
