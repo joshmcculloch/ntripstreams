@@ -506,12 +506,15 @@ class NtripStream:
 
         Data is buffered until a frame preamble is found and the frame is
         CRC-24Q verified; on a CRC mismatch the buffer is realigned and the
-        search continues.
+        search continues. Frames already in the buffer are returned before the
+        socket is read again, so buffered frames are never held back waiting
+        for the caster to send more data.
 
         Raises
         ------
         ConnectionError
-            If the connection fails while receiving data.
+            If the connection fails or is closed by the caster while receiving
+            data.
         IOError
             If a chunk is malformed or incomplete.
 
@@ -521,52 +524,74 @@ class NtripStream:
             The validated RTCM 3 frame and the Unix timestamp at which it was
             received.
         """
+        while True:
+            timeStamp = time()
+            rtcmFrame = self._extractRtcmFrame()
+            if rtcmFrame is not None:
+                return rtcmFrame, timeStamp
+            # Only read from the socket once no complete frame is left in the
+            # buffer, so it cannot grow faster than frames are consumed, and a
+            # partial frame of any size always gets the data it needs.
+            if self.ntripStreamChunked:
+                try:
+                    rawLine = await self.ntripReader.readuntil(b"\r\n")
+                    length = int(rawLine[:-2].decode("ISO-8859-1"), 16)
+                    rawLine = await self.ntripReader.readexactly(length + 2)
+                except (
+                    asyncio.IncompleteReadError,
+                    asyncio.LimitOverrunError,
+                ) as error:
+                    logging.error(
+                        f"Connection to {self.casterUrl} failed with: {error}"
+                        "during data reception."
+                    )
+                    raise ConnectionError(
+                        f"Connection to {self.casterUrl} failed with: {error}"
+                        "during data reception."
+                    ) from None
+                if rawLine[-2:] != b"\r\n":
+                    logging.error(
+                        f"{self.ntripMountPoint}:Chunk malformed. "
+                        "Expected \r\n as ending. Closing connection!"
+                    )
+                    raise IOError("Chunk malformed ")
+                receivedBytes = BitStream(rawLine[:-2])
+                logging.debug(f"Chunk {receivedBytes.length}:{length * 8}. ")
+            else:
+                rawLine = await self.ntripReader.read(2048)
+                # read() returns b"" at EOF without suspending; without this
+                # check the loop would spin and block the event loop.
+                if not rawLine:
+                    logging.error(
+                        f"Connection to {self.casterUrl} closed by caster "
+                        "during data reception."
+                    )
+                    raise ConnectionError(
+                        f"Connection to {self.casterUrl} closed by caster "
+                        "during data reception."
+                    )
+                receivedBytes = BitStream(rawLine)
+            if self.ntripStreamChunked and receivedBytes.length != length * 8:
+                logging.error(
+                    f"{self.ntripMountPoint}:Chunk incomplete "
+                    f"{receivedBytes.length}:{length * 8}. "
+                    "Closing connection! "
+                )
+                raise IOError("Chunk incomplete ")
+            self.rtcmFrameBuffer += receivedBytes
+
+    def _extractRtcmFrame(self):
+        """Remove the next complete, CRC-validated RTCM 3 frame from the buffer.
+
+        Returns
+        -------
+        bitstring.BitStream or None
+            The frame, or ``None`` if the buffer does not yet hold a complete
+            frame and more data must be read.
+        """
         rtcm3FramePreample = Bits(bin="0b11010011")
         rtcm3FrameHeaderFormat = "bin:8, pad:6, uint:10"
-        rtcmFrameComplete = False
-        while not rtcmFrameComplete:
-            timeStamp = time()
-            # Only read from the socket when the buffer is running low so it does
-            # not grow faster than frames are consumed. The 16384-bit (2048-byte)
-            # low-water mark stays well above the maximum RTCM3 frame size
-            # (8232 bits) so any single frame can always be fully accumulated.
-            if self.rtcmFrameBuffer.length < 16384:
-                if self.ntripStreamChunked:
-                    try:
-                        rawLine = await self.ntripReader.readuntil(b"\r\n")
-                        length = int(rawLine[:-2].decode("ISO-8859-1"), 16)
-                        rawLine = await self.ntripReader.readexactly(length + 2)
-                    except (
-                        asyncio.IncompleteReadError,
-                        asyncio.LimitOverrunError,
-                    ) as error:
-                        logging.error(
-                            f"Connection to {self.casterUrl} failed with: {error}"
-                            "during data reception."
-                        )
-                        raise ConnectionError(
-                            f"Connection to {self.casterUrl} failed with: {error}"
-                            "during data reception."
-                        ) from None
-                    if rawLine[-2:] != b"\r\n":
-                        logging.error(
-                            f"{self.ntripMountPoint}:Chunk malformed. "
-                            "Expected \r\n as ending. Closing connection!"
-                        )
-                        raise IOError("Chunk malformed ")
-                    receivedBytes = BitStream(rawLine[:-2])
-                    logging.debug(f"Chunk {receivedBytes.length}:{length * 8}. ")
-                else:
-                    rawLine = await self.ntripReader.read(2048)
-                    receivedBytes = BitStream(rawLine)
-                if self.ntripStreamChunked and receivedBytes.length != length * 8:
-                    logging.error(
-                        f"{self.ntripMountPoint}:Chunk incomplete "
-                        f"{receivedBytes.length}:{length * 8}. "
-                        "Closing connection! "
-                    )
-                    raise IOError("Chunk incomplete ")
-                self.rtcmFrameBuffer += receivedBytes
+        while True:
             if not self.rtcmFrameAligned:
                 rtcmFramePos = self.rtcmFrameBuffer.find(
                     rtcm3FramePreample, bytealigned=True
@@ -577,29 +602,30 @@ class NtripStream:
                     self.rtcmFramePreample = True
                 else:
                     self.rtcmFrameBuffer = BitStream()
-            if self.rtcmFramePreample and self.rtcmFrameBuffer.length >= 48:
-                # Reset the read position before peeking: bitstring >= 4.1.0 no
-                # longer guarantees pos == 0 after slicing/concatenating the
-                # buffer, which would otherwise peek the header at a wrong offset.
-                self.rtcmFrameBuffer.pos = 0
-                rtcmPreAmple, rtcmPayloadLength = self.rtcmFrameBuffer.peeklist(
-                    rtcm3FrameHeaderFormat
-                )
-                rtcmFrameLength = (rtcmPayloadLength + 6) * 8
-                if self.rtcmFrameBuffer.length >= rtcmFrameLength:
-                    rtcmFrame = self.rtcmFrameBuffer[:rtcmFrameLength]
-                    calcCrc = crc24q(rtcmFrame[:-24])
-                    frameCrc = rtcmFrame[-24:].unpack("uint:24")
-                    if calcCrc == frameCrc[0]:
-                        self.rtcmFrameAligned = True
-                        self.rtcmFrameBuffer = self.rtcmFrameBuffer[rtcmFrameLength:]
-                        rtcmFrameComplete = True
-                    else:
-                        self.rtcmFrameAligned = False
-                        self.rtcmFrameBuffer = self.rtcmFrameBuffer[8:]
-                        logging.warning(
-                            f"{self.ntripMountPoint}:CRC mismatch "
-                            f"{hex(calcCrc)} != {rtcmFrame[-24:]}."
-                            f" Realigning!"
-                        )
-        return rtcmFrame, timeStamp
+                    return None
+            if not self.rtcmFramePreample or self.rtcmFrameBuffer.length < 48:
+                return None
+            # Reset the read position before peeking: bitstring >= 4.1.0 no
+            # longer guarantees pos == 0 after slicing/concatenating the
+            # buffer, which would otherwise peek the header at a wrong offset.
+            self.rtcmFrameBuffer.pos = 0
+            rtcmPreAmple, rtcmPayloadLength = self.rtcmFrameBuffer.peeklist(
+                rtcm3FrameHeaderFormat
+            )
+            rtcmFrameLength = (rtcmPayloadLength + 6) * 8
+            if self.rtcmFrameBuffer.length < rtcmFrameLength:
+                return None
+            rtcmFrame = self.rtcmFrameBuffer[:rtcmFrameLength]
+            calcCrc = crc24q(rtcmFrame[:-24])
+            frameCrc = rtcmFrame[-24:].unpack("uint:24")
+            if calcCrc == frameCrc[0]:
+                self.rtcmFrameAligned = True
+                self.rtcmFrameBuffer = self.rtcmFrameBuffer[rtcmFrameLength:]
+                return rtcmFrame
+            self.rtcmFrameAligned = False
+            self.rtcmFrameBuffer = self.rtcmFrameBuffer[8:]
+            logging.warning(
+                f"{self.ntripMountPoint}:CRC mismatch "
+                f"{hex(calcCrc)} != {rtcmFrame[-24:]}."
+                f" Realigning!"
+            )
